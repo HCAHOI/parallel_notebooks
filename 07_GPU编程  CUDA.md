@@ -314,3 +314,557 @@ int main() {
 
 ## 内存管理
 
+### 如何从核函数里返回数据
+
+我们试着把kernel里的返回类型声明为int, 试图从GPU返回数据到CPU, 但是这会在编译器出错, 为什么
+
+刚刚说了 kernel 的调用是**异步**的，返回的时候，并不会实际让 GPU 把核函数执行完毕，必须 cudaDeviceSynchronize() 等待他执行完毕（和线程的 join 很像）。所以，不可能从 kernel 里通过返回值获取 GPU 数据，因为 kernel 返回时核函数并没有真正在 GPU 上执行。所以核函数返回类型必须是 void
+
+那如果我们传入一个指针可以吗
+
+```cpp
+#include<cstdio>
+#include<cuda_runtime.h>
+
+__global__ void kernel(int *pres) {
+    *pres = 42;
+}
+
+int main() {
+    int res = 0;
+    kernel<<<1, 1>>>(&res);
+    cudaDeviceSynchronize();
+    printf("%d", res);
+    return 0;
+}
+```
+
+运行后发现, res打印结果仍然为0
+
+难道是因为我们的 res 创建在栈上，所以 GPU 不能访问，才出错的？
+
+试着用 malloc 在堆上分配一个 int 来给 GPU 访问，结果还是失败了
+
+### 错误检查
+
+CUDA的函数, 比如cudaDeviceSynchronize(), 它们出错时, 并不会直接终止程序, 也不会抛出C++的异常, 而是返回一个错误代码, 告诉你发生了什么错误, 这是处于通用性考虑
+
+这个错误代码的类型是cudaError_t, 其实就是个enum类型,相当于int
+
+通过cudaGetErrorName, 获取该错误代码的具体名字, 这里错误代码是77, 具体名字是cudaErrorIllegalAddress. 意思是说我们访问了非法的地址, 和CPU上的Segmentaton Fault差不多
+
+```cpp
+#include<cstdio>
+#include<cuda_runtime.h>
+
+__global__ void kernel(int *pres) {
+    *pres = 42;
+}
+
+int main() {
+    int res = 0;
+    kernel<<<1, 1>>>(&res);
+    cudaError_t err = cudaDeviceSynchronize();
+    printf("%d\n", err);
+    printf("%s\n", cudaGetErrorName(err));
+    
+    return 0;
+}
+```
+
+* 不过, CUDA已经提供了封装的版本
+
+ CUDA toolkit 安装时，会默认附带一系列案例代码，这些案例中提供了一些非常有用的头文件和工具类，比如这个文件：
+
+/opt/cuda/samples/common/inc/helper_cuda.h
+
+把他和 helper_string.h 一起拷到头文件目录里，然后改一下 CMakeLists.txt 让他包含这个头文件目录。
+
+他定义了 checkCudaErrors 这个宏，使用时只需：
+
+```cpp
+checkCudaErrors(cudaDeviceSynchronize());
+```
+
+即可自动帮你检查错误代码并打印在终端，然后退出。还会报告出错所在的行号，函数名等，很方便。
+
+### 原因分析
+
+原来，GPU 和 CPU 各自使用着独立的内存。CPU 的内存称为主机内存(host)。GPU 使用的内存称为设备内存(device)，他是显卡上板载的，速度更快，又称显存。
+
+而不论栈还是 malloc 分配的都是 CPU 上的内存，所以自然是无法被 GPU 访问到。
+
+因此可以用 cudaMalloc 分配 GPU 上的显存，这样就不出错了，结束时 cudaFree 释放。
+
+注意到 cudaMalloc 的返回值已经用来表示错误代码，所以返回指针只能通过 &pret 二级指针。
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+
+__global__ void kernel(int *pret) {
+    *pret = 42;
+}
+
+int main() {
+    int *pret;	//只是在cpu里分配了内存
+    checkCudaErrors(cudaMalloc(&pret, sizeof(int)));	//在显存上分配了内存
+    kernel<<<1, 1>>>(pret);
+    checkCudaErrors(cudaDeviceSynchronize());
+    cudafree(pret);
+    return 0;
+}
+```
+
+**反之亦然，CPU也不能访问 GPU 的内存地址**
+
+如果尝试使用
+
+```cpp
+printf("%d\n", *pret);
+```
+
+打印42,那么将会发现程序抛出了经典段错误segmentation fault
+
+因为这个时候pret是在显存上的, CPU也同样无法访问
+
+### 跨 GPU/CPU 地址空间拷贝数据
+
+可以使用cudaMemory, 它能够在GPU和CPU之间拷贝数据
+
+这里我们希望把GPU上的内存数据拷贝到CPU内存上, 也就是从设备内存(device)到主机内存(host), 因此第四个参数指定为cudaMemcpyDeviceToHost
+
+同理, 还有cudaMemcpyHostToDevice和cudaMemcpyDeviceToDevice
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+
+__global__ void kernel(int *pret) {
+    *pret = 42;
+}
+
+int main() {
+    int *pret;
+    checkCudaErrors(cudaMalloc(&pret, sizeof(int)));
+    kernel<<<1, 1>>>(pret);
+    checkCudaErrors(cudaDeviceSynchronize());
+    
+    int ret;
+    checkCudaErrors(cudaMemcpy(&ret, pret, sizeof(int), cudaMemcpyDeviceToHost);
+    printf("%d", &ret);
+                    
+    cudaFree(pret);
+    return 0;
+}
+```
+
+**注意** : cudaMemcpy会自动进行同步操作, 即和cudaDeviceSynchronize()等价,所以上面的cudaDeviceSynchronize()实际上可以删掉了
+
+### 统一内存地址技术
+
+还有一种在比较新的显卡上支持的特性, 统一内存(managed), 只需把cudaMalloc换成cudaMallocManaged即可, 释放时也是通过cudaFreee, 这样分配出来的地址, 不论在CPU上还是在GPU上都是一样的, 都可以访问. 而且拷贝也会自动按需进行(当从CPU访问时), 无需手动调用cudaMemcpy
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+
+__global__ void kernel(int *pret) {
+	*pret = 42;
+}
+
+int main() {
+    int *pret;
+    checkCudaErrors(cudaMemcpyManaged(&pret, sizeof(int)));
+    kernel<<<1, 1>>>(pret);
+    checkCudaErrors(cudaDeviceSynchronize());
+    printf("%d", *pret);
+    cudaFree(pret);
+    return 0;
+}
+```
+
+### 总结
+
+主机内存(host) : malloc, free
+
+设备内存(device) : cuadMalloc, cudaFree
+
+统一内存(managed) : cudaMallocManaged, cudaFree
+
+统一内存虽然方便,但并不是完全没有开销, 如果有条件的化还是尽量用分离的主机内存和设备内存吧
+
+## 数组
+
+### 分配数组
+
+和malloc一样,可以用cudaMalloc配合n * sizeof(int), 分配一个大小为n的整型数组, 而 arr 则是指向其起始地址。然后把 arr 指针传入 kernel，即可在里面用 arr[i] 访问他的第 i 个元素。
+
+因为我们用的统一内存(managed)，所以同步以后 CPU 也可以直接读取。
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+
+__global__ kernel(int *arr, int n) {
+    for(int i = 0;i < n;i++) {
+        arr[i] = 1;
+    }
+}
+
+int main() {
+    int n = 32;
+    int *arr;
+    checkCudeErrors(cudaMallocManaged(&arr, n * sizeof(int)));
+    kernel<<<1, 1>>>(pret, n);
+    checkCudaErrors(cudaDeviceSynchronize());
+    for(int i = 0;i < n;i++) {
+		printf("arr[%d]: %d\n",i, arr[i]);
+    }
+    cudaFree(arr);
+	return 0;
+}
+```
+
+### 并行赋值
+
+刚刚的for循环是串行的， 我们可以把线程数目调为n， 然后用threadIdx.x作为索引, 这样就实现了每个线程负责给数组中的一个元素赋值
+
+```cpp
+__global__ void kernel(int *arr, int n) {
+    int i = threadIdx.x;
+    arr[i] = 1;
+}
+
+int main() {
+    int *pret;
+    checkCudaErrors(cudaMallocManaged(&arr, n * sizeof(int)));
+    kernel<<<1, n>>>(arr, n);
+    checkCudaErrors(cudaDeviceSynchronize());
+    //...
+	return 0;
+}
+```
+
+### 从线程到板块
+
+核函数内部，用之前说到的 blockDim.x + blockIdx.x + threadIdx.x 来获取线程在整个网格中编号。
+
+外部调用者，则是根据不同的 n 决定板块的数量（gridDim），而每个板块具有的线程数量（blockDim）则是固定的 128。
+
+因此，我们可以用 n / 128 作为 gridDim，这样总的线程数刚好的 n，实现了每个线程负责处理一个元素。
+
+```cpp
+__global__ void kernel(int *arr, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    arr[i] = 1;
+}
+
+int main() {
+    int n = 65536;
+    int *arr;
+    checkCudaErrors(cudaMallocManaged(&arr, n * sizeof(int)));
+    
+    int nthreads = 128;
+    int nblocks = n / nthreads;
+    kernel<<<nblocks, nthreads>>>(arr, n);
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    ...
+}
+```
+
+但是这样的话n必须是128的整数倍,不然因为C/C++的整数除法是向下取整的,如果n=65535,那么最后127的元素是没有赋值的
+
+解决方案 : 通过数学方法(n + nthreads - 1) / nthreads把这个除法改为向上取整
+
+由于向上取整，这样会多出来一些线程，因此要在 kernel 内判断当前 i 是否超过了 n，如果超过就要提前退出，防止越界。
+
+```cpp
+__global__ void kernel(int *arr, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i > n) return;
+    arr[i] = 1;
+}
+```
+
+### 小技巧 ：网格跨步循环(grid-stride loop)
+
+无论调用者指定每个板块多少线程（blockDim），总共多少板块（gridDim）。都能自动根据给定的 n 区间循环，不会越界，也不会漏掉几个元素。
+
+这样一个for循环非常符合CPU上常见的parallel_for的习惯, 又能自动匹配不同的blockDim 和 gridDim, 看起来非常方便
+
+```cpp
+__global__ void kernel(int *arr, int n) {
+    for(int i = blockDim.x * blockIdx.x + threadIdx.x; i < n;i += girdDim.x * blockDim.x) {
+        arr[i] = 1;
+    }
+}
+```
+
+##  C++封装
+
+### 抽象的std::allocator接口
+
+你知道吗？std::vector 作为模板类，其实有两个模板参数：std::vector<T, AllocatorT>
+
+那为什么我们平时只用了 std::vector\<T> 呢？因为第二个参数默认是 std::allocator\<T>。
+
+也就是 std::vector\<T> 等价于 std::vector<T, std::allocator\<T>>。
+
+std::allocator\<T> 的功能是负责分配和释放内存，初始化 T 对象等等。
+
+他具有如下几个成员函数：
+
+```cpp
+T *allocate(size_t n)            // 分配长度为n，类型为T的数组，返回其起始地址
+
+void deallocate(T *p, size_t n)    // 释放长度为n，起始地址为p，类型为T的数组
+```
+
+vector 会调用 std::allocator\<T> 的 allocate/deallocate 成员函数，他又会去调用标准库的 malloc/free 分配和释放内存空间（即他分配是的 CPU 内存）。
+
+我们可以自己定义一个和 std::allocator\<T> 一样具有 allocate/deallocate 成员函数的类，这样就可以“骗过”vector，让他不是在 CPU 内存中分配，而是在 CUDA 的统一内存(managed)上分配。
+
+实际上这种“骗”来魔改类内部行为的操作，正是现代 C++ 的 concept 思想所在。因此替换 allocator 实际上是标准库允许的，因为他提升了标准库的泛用性。
+
+```cpp
+template <class T>
+struct CudaAllocator {
+    using value_type = T;
+    
+    T *allocate(size_t size) {
+        T *ptr = nullptr;
+        checkCudaErrors(cudaMallocManaged(&ptr, size * sizeof(T)));
+        return ptr;
+    }
+    
+    void deallocate(T *ptr, size_t size = 0) {
+        checkCudaErrors(cudaFree(ptr));
+    }
+};
+
+__global__ void kernel(int *arr, int n) {
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < n;i += blockDim.x * gridDim.x) {
+        arr[i] = 1;
+    } 
+}
+
+int main() {
+    int n = 65536;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    
+    kernel<<<32, 128>>>(arr, n);
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    //...
+    return 0;
+}
+```
+
+### 进一步 : 避免初始化为0
+
+vector 在初始化的时候（或是之后 resize 的时候）会调用所有元素的无参构造函数，对 int 类型来说就是零初始化。然而这个初始化会是在 CPU 上做的，因此我们需要禁用他。
+
+可以通过给 allocator 添加 construct 成员函数，来魔改 vector 对元素的构造。默认情况下他可以有任意多个参数，而如果没有参数则说明是无参构造函数。
+
+因此我们只需要判断是不是有参数，然后是不是传统的 C 语言类型（plain-old-data），如果是，则跳过其无参构造，从而避免在 CPU 上低效的零初始化。
+
+```cpp
+template <class T>
+struct CudaAllocator {
+    using value_type = T;
+    
+    T *allocate(size_t size) {
+        T *ptr = nullptr;
+        checkCudaErrors(cudaMallocManaged(&ptr, size * sizeof(T)));
+        return ptr;
+    }
+    
+    void deallocate(T *ptr, size_t size = 0) {
+        checkCudaErrors(cudaFree(ptr));
+    }
+    
+    template <class ...Args>
+    void construct(T *p, Args &&...args) {
+        if constexpr (!(sizeof...(Args) == 0 && std::is_pod_v<T>))
+            ::new((void *)p) T(std::forward<Args>(args)...);
+    }
+};
+```
+
+### 进一步 : 核函数可以是模板函数
+
+刚刚说过 CUDA 的优势在于对 C++ 的完全支持。所以 __global__ 修饰的核函数自然也是可以为模板函数的。
+
+调用模板时一样可以用自动参数类型推导，如有手动指定的模板参数（单尖括号）请放在三重尖括号的前面。
+
+```cpp
+template<int N, class T>
+__global__ void kernel(T *arr) {
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < N;i += blockDim.x * gridDim.x) {
+        arr[i] = 1;
+    } 
+}
+
+int main() {
+    int n = 65536;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    
+    kernel<n><<<32, 128>>>(arr.data());
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    //...
+    return 0;
+}
+```
+
+### 进一步 : 核函数可以接受函子(functor) , 实现函数式编程
+
+* 不过要注意三点：
+
+1. 这里的 Func 不可以是 Func const &，那样会变成一个指向 CPU 内存地址的指针，从而出错。所以 CPU 向 GPU 的传参必须按值传。
+
+2. 做参数的这个函数必须是一个有着成员函数 operator() 的类型，即 functor 类。而不能是独立的函数，否则报错。
+
+3. 这个函数必须标记为 __device__，即 GPU 上的函数，否则会变成 CPU 上的函数。
+
+```cpp
+template <class Func>
+__global__ void parallel_for(int n, Func func) {
+    for(int i = blockDim.x * blockIdx.x + threadIdx.x; i < n;i += gridDim.x * blockDim.x) {
+        func(i);
+    }
+}
+
+struct MyFunctor {
+    __device__ void operator()(int i) const {
+        printf("number %d\n", i);
+    }
+};
+
+int main() {
+    int n = 65536;
+    
+    parallel_for<<<32, 128>>>(n, MyFunctor{};
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    
+    return 0;
+}
+```
+
+### 进一步 : 函子可以是lambda表达式
+
+可以直接写 lambda 表达式，不过必须在 [] 后，() 前，插入 __device__ 修饰符。
+
+而且需要开启 --extended-lambda 开关。
+
+为了只对 .cu 文件开启这个开关，可以用 CMake 的生成器表达式，限制 flag 只对 CUDA 源码生效，这样可以混合其他 .cpp 文件也不会发生 gcc 报错的情况了
+
+```cmake
+target_compile_options(main PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+```
+
+```cpp
+template <class Func>
+__global__ void parallel_for(int n, Func func) {
+    for(int i = blockDim.x * blockIdx.x + threadIdx.x; i < n;i += gridDim.x * blockDim.x) {
+        func(i);
+    }
+}
+
+int main() {
+    int n = 65536;
+    
+    parallel_for<<<32, 128>>>(n, [] __device__ (int i) {
+        printf("number %d\n", i);
+    });
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    
+    return 0;
+}
+```
+
+### 如何捕获外部变量
+
+#### 尝试一
+
+```cpp
+template <class Func>
+__global__ void parallel_for(T *arr) {
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < n;i += blockDim.x * gridDim.x) {
+        func(i);
+    } 
+}
+
+int main() {
+    int n = 65536;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    
+   	parallel_for<<<32, 128>>>(n, [&] __device__ (int i) {
+       	arr[i] = 1; 
+    });
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    return 0;
+}
+```
+
+此时,如果单纯的把lambda表达式中的[]改为[&]将会出错,因为此时捕获到的是堆栈(CPU内存)上的变量arr本身, 而不是arr所指向的内存地址(GPU内存)
+
+#### 尝试二
+
+那么,如果我们改为[=]按值捕获呢
+
+错了，不要忘了，vector 的拷贝是深拷贝（绝大多数C++类都是深拷贝，除了智能指针和原始指针）。这样只会把 vector 整个地拷贝到 GPU 上！而不是浅拷贝其起始地址指针。
+
+#### 解决方案
+
+正确的做法是先获取 arr.data() 的值到 arr_data 变量，然后用 [=] 按值捕获 arr_data，函数体里面也通过 arr_data 来访问 arr。
+
+为什么这样？因为 data() 返回一个起始地址的原始指针，而原始指针是浅拷贝的，所以可以拷贝到 GPU 上，让他访问。这样和之前作为核函数参数是一样的，不过是作为 Func 结构体统一传入了。
+
+```cpp
+template <class Func>
+__global__ void parallel_for(T *arr) {
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < n;i += blockDim.x * gridDim.x) {
+        func(i);
+    } 
+}
+
+int main() {
+    int n = 65536;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    
+    int *arr_data = arr.data();
+   	parallel_for<<<32, 128>>>(n, [&] __device__ (int i) {
+       	arr_data[i] = 1; 
+    });
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    return 0;
+}
+```
+
+或者在[] 里这样直接写自定义捕获的表达式也是可以的，这样就可以用同一变量名
+
+```
+int main() {
+    int n = 65536;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    
+   	parallel_for<<<32, 128>>>(n, [arr = arr.data()] __device__ (int i) {
+       	arr_data[i] = 1; 
+    });
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    return 0;
+}
+```
+
