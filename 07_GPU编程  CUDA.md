@@ -208,3 +208,109 @@ CUDA中还有比线程更大的概念,板块(block)，一个板块可以有多�
 **<<<板块数量，每个板块中的线程数量>>>**
 
 而板块的编号通过blockIdx.x获取, 板块的总数通过gridDim获取
+
+**注意 : **板块和板块之间,线程和线程之间是高度并行的,不存在板块/线程0的Hello world!就一定打印的比板块/线程1早的情况
+
+### 板块和线程的扁平化
+
+你可能觉得纳闷，既然已经有线程可以并行了，为什么还要引入板块的概念？稍后会说明区分板块的重要原因。
+
+* 如需总的线程数量：blockDim * gridDim
+
+* 如需总的线程编号：blockDim * blockIdx + threadIdx
+
+运行
+
+```cpp
+#include<cstdio>
+#include<cuda_runtime.h>
+
+__global__ void kernel() {
+	unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int tnum = gridDim.x * blockDim.x;
+    printf("Flattened Thread %d of %d\n", tid, tnum);
+}
+
+int main() {
+    kernel<<<2, 3>>>();
+    cudaDeviceSynchronize();
+	return 0;
+}
+```
+
+实际上 GPU 的板块相当于 CPU 的线程，GPU 的线程相当于 CPU 的SIMD，可以这样理解，但不完全等同
+
+### 三维的板块和线程编号
+
+CUDA也支持三维的板块和线程区间
+
+只要把三重尖括号内指定的参数改成dim3类型即可,dim3 的构造函数就是接受三个无符号整数（unsigned int）非常简单。
+
+这样在核函数里就可以通过 threadIdx.y 获取 y 方向的线程编号，以此类推。
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+
+__global__ void kernel() {
+    printf("Block (%d,%d,%d) of (%d,%d,%d), Thread (%d,%d,%d) of (%d,%d,%d)\n",
+           blockIdx.x, blockIdx.y, blockIdx.z,
+           gridDim.x, gridDim.y, gridDim.z,
+           threadIdx.x, threadIdx.y, threadIdx.z,
+           blockDim.x, blockDim.y, blockDim.z);
+}
+
+int main() {
+    kernel<<<dim3(2, 1, 1), dim3(2, 2, 2)>>>();
+    cudaDeviceSynchronize();
+    return 0;
+}
+```
+
+![image-20220301155124261](.\img\image-20220301155124261.png)
+
+同理,如果需要二维和一维,使用<<<dim3(x,y,1), dim3(m,n,1)>>>和<<<dim3(m,1,1), dim3(n,1,1)>>>
+
+之所以会把板块和线程区分为三维之, 主要是因为 GPU 的业务常常涉及到三维图形学和二维图像，这样很方便，并不一定 GPU 硬件上是三维排列的\
+
+![image-20220301155449439](.\img\image-20220301155449439.png)
+
+### 分离\__device__的声明和定义
+
+默认情况下 GPU 函数必须定义在同一个文件里。如果你试图分离声明和定义，调用另一个文件里的 \__device__ 或 \_ _ global__ 函数，就会出错。
+
+解决方案 : 开启 CMAKE_CUDA_SEPARABLE_COMPILATION, 即可启动分离声明和定义的支持
+
+```cmake
+set(CMAKE_CUDA_SEPARABLE_COMLPILATION)
+```
+
+但是最好还是把定义和声明放在一个文件里,这样方便编译器自动内联优化(notebook_04)
+
+### 核函数调用核函数
+
+从Kelper架构开始,\_______global______ 里可以调用另一个 \__ global__,也就是说核函数可以调用另一个核函数, 且其三重尖括号里的板块数和线程数可以动态指定，无需先传回到 CPU 再进行调用，这是 CUDA 特有的能力。
+
+```cpp
+__global__ void another() {
+    printf("another: Thread %d of %d\n", threadIdx.x, blockDim.x);
+}
+
+__global__ void kernel() {
+    printf("kernel: Thread %d of %d\n", threadIdx.x, blockDim.x);
+    int numthreads = threadIdx.x * threadIdx.x + 1;
+    another<<<1, numthreads>>>();
+    printf("kernel: called another with %d threads\n", numthreads);
+}
+
+int main() {
+    kernel<<<1, 3>>>();
+    cudaDeviceSynchronize();
+    return 0;
+}
+```
+
+![image-20220301160900374](.\img\image-20220301160900374.png)
+
+## 内存管理
+
