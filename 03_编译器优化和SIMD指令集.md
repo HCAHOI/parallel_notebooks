@@ -16,6 +16,12 @@
 
 一般情况下,函数的前六个参数通过rdi,rsi,rdx,rcx,r8d,r9d传入,存储到堆栈上
 
+我们可以使用objdump工具来查看生成的机器码的反汇编
+
+```bash
+objdump -d hello.o
+```
+
 ##### gcc汇编指令后缀
 
 对于
