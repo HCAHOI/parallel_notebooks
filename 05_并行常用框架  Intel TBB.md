@@ -14,6 +14,17 @@
 
 ### Intro
 
+如何启用tbb
+
+安装后在CMakelist.txt中添加
+
+```cmake
+find_package(TBB REQUIRED)
+target_link_libraries(main PUBLIC TBB::tbb)
+```
+
+即可
+
 上一篇我们基于标准库进行了多线程运行
 
 ```cpp
