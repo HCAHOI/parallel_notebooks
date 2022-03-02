@@ -1,3 +1,7 @@
+---
+typora-copy-images-to: img
+---
+
 # GPU编程 : CUDA
 
 ## Hello, world!
@@ -725,6 +729,10 @@ int main() {
 
 ### 进一步 : 核函数可以接受函子(functor) , 实现函数式编程
 
+什么是functor
+
+functor不是函数,而是类,但是通过重载()运算符,使其可以像函数一样被调用,所以又被称为仿函数
+
 * 不过要注意三点：
 
 1. 这里的 Func 不可以是 Func const &，那样会变成一个指向 CPU 内存地址的指针，从而出错。所以 CPU 向 GPU 的传参必须按值传。
@@ -750,7 +758,7 @@ struct MyFunctor {
 int main() {
     int n = 65536;
     
-    parallel_for<<<32, 128>>>(n, MyFunctor{};
+    parallel_for<<<32, 128>>>(n, MyFunctor{});
     
     checkCudaErrors(cudaDeviceSynchronize());
     
@@ -832,7 +840,7 @@ int main() {
 
 ```cpp
 template <class Func>
-__global__ void parallel_for(T *arr) {
+__global__ void parallel_for(int n, Func func) {
     for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < n;i += blockDim.x * gridDim.x) {
         func(i);
     } 
@@ -840,31 +848,458 @@ __global__ void parallel_for(T *arr) {
 
 int main() {
     int n = 65536;
-    std::vector<int, CudaAllocator<int>> arr(n);
+    std::vector<int,CudaAllocator<int>> arr(n);
     
     int *arr_data = arr.data();
-   	parallel_for<<<32, 128>>>(n, [&] __device__ (int i) {
-       	arr_data[i] = 1; 
+    parallel_for<<<32, 128>>>(n, [=] __device__ (int i) {
+       arrdata[i] = i; 
     });
     
-    checkCudaErrors(cudaDeviceSynchronize());
     return 0;
 }
 ```
 
 或者在[] 里这样直接写自定义捕获的表达式也是可以的，这样就可以用同一变量名
 
-```
+```cpp
 int main() {
     int n = 65536;
     std::vector<int, CudaAllocator<int>> arr(n);
     
    	parallel_for<<<32, 128>>>(n, [arr = arr.data()] __device__ (int i) {
-       	arr_data[i] = 1; 
+       	arr_data[i] = i; 
     });
     
     checkCudaErrors(cudaDeviceSynchronize());
     return 0;
 }
 ```
+
+## 数学运算
+
+### 案例 : 并行求sin值
+
+就让我们在 GPU 上并行地计算从 sin(0) 到 sin(65535) 的值，并填入到数组 arr 中。
+
+这里为什么用 sinf 而不是 sin？因为 sin 是 double 类型的正弦函数，而我们需要的 sinf 是 float 类型的正弦函数。可不要偷懒少打一个 f 哦，否则影响性能。
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+#include "CudaAllocator.h"
+
+template<class Func>
+__global__ kernel(int n, Func func) {
+	for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < n;i += blockDim.x * gridDim.x) {
+        func(i);
+    }
+}
+
+int main() {
+    int n = 65535;
+    std::vector<float,CudaAllocator<float>> arr(n);
+    
+    kernel<<<32, 128>>>(n, [arr = arr.data()](int i){
+        arr[i] = sinf(i);
+    });
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+    return 0;
+}
+```
+
+适当调整板块数量gridDim和线程数目blockDim,还可能更快
+
+注 : 像sinf一样的数学函数还有sqrtf，rsqrtf，cbrtf，rcbrtf，powf，sinf，cosf，sinpif，cospif，sincosf，sincospif，logf，log2f，log10f，expf，exp2f，exp10f，tanf，atanf，asinf，acosf，fmodf，fabsf，fminf，fmaxf。
+
+### __sinf
+
+•两个下划线的 __sinf 是 GPU intrinstics，精度相当于 GLSL 里的那种。适合对精度要求不高，但有性能要求的图形学任务。
+
+•类似的这样的低精度內建函数还有 
+
+```cpp
+__expf、__logf、__cosf、__powf 
+```
+
+•还有 __fdividef(x, y) 提供更快的浮点除法，和一般的除法有相同的精确度，但是在 2^216 < y < 2^218 时会得到错误的结果。
+
+### 编译器选项 : --use_fast_math
+
+如果开启了 --use_fast_math 选项，那么所有对 sinf 的调用都会自动被替换成 __sinf。
+
+--ftz=true 会把极小数(denormal)退化为0。
+
+--prec-div=false 降低除法的精度换取速度。
+
+--prec-sqrt=false 降低开方的精度换取速度。
+
+--fmad 因为非常重要，所以默认就是开启的，会自动把 a * b + c 优化成乘加(FMA)指令。
+
+开启 --use_fast_math 后会自动开启上述所有
+
+### 案例 : SAXPY
+
+SAXPY(Scalar A times X Plus Y), 即标量 A 乘 X 加 Y
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+#include "CudaAllocator.h"
+
+template<class Func>
+__global__ void parallel_for(int i, Func func) {
+    for(int i = blockIdx.x * blockDim.x;i < n;i += blockDim.x * gridDim.x) {
+        func(i);
+    }
+}
+
+int main() {
+    int n = 65536;
+    float a = 1.0f;
+    
+    std::vector<float, CudaAllocator<float>> x(n);
+    std::vector<float, CudaAllocator<float>> y(n);
+    
+    for(int i = 0;i < n; i++) {
+        x[i] = std::rand() + (1.f / RAND_MAX);	//生成[0,1)的浮点数
+        y[i] = std::rand() + (1.f / RAND_MAX);
+    }
+    
+    parallel_for<<<32, 128>>>(n, [a, x = x.data(), y = y.data()] __device__ (int i) {
+       x[i] = a * x[i] + y[i]; 
+    });
+    
+    checkCudaErrors(cudaDeviceSynchronize());
+	return 0;
+}
+```
+
+## thrust库
+
+### thrust::universal_vector
+
+虽然自己实现CudaAllocator很有趣, 也帮助我们理解了底层原理, 但是既然CUDA官方已经提供了thrust库, 那就用它们的好啦
+
+universal_vector会在统一内存上分配, 因此不论CPU还是GPU都可以访问到
+
+```cpp
+thrust::universal_vector<float> x(n);
+```
+
+### 分离的device_vector和host_vector
+
+而 device_vector 则是在 GPU 上分配内存，host_vector 在 CPU 上分配内存。
+
+可以通过 = 运算符在 device_vector 和 host_vector 之间拷贝数据，他会自动帮你调用 cudaMemcpy，非常智能。
+
+比如这里的 x_dev = x_host 会把 CPU 内存中的 x_host 拷贝到 GPU 的 x_dev 上。
+
+```cpp
+thrust::host_vector<float> x_host(n);
+thrust::device_vector<float> x_dev = x_host
+```
+
+### 模板函数
+
+#### thrust::generate
+
+thrust 提供了很多类似于标准库里的模板函数，比如 thrust::generate(b, e, f) 对标 std::generate，用于批量调用 f() 生成一系列（通常是随机）数，写入到 [b, e) 区间。
+
+其前两个参数是 device_vector 或 host_vector 的迭代器，可以通过成员函数 begin() 和 end() 得到。第三个参数可以是任意函数，这里用了 lambda 表达式。
+
+```cpp
+int n = 65536;
+thrust::host_vector<float> x(n);
+
+auto float_rant = [] {
+    return rand() / (RAND_MAX + 1.0f);
+}
+
+thrust::generate(x.begin(), x.end(), float_rand);
+```
+
+#### thrust::for_each
+
+同理还有thrust::for_each(b, e, f)对标std::for_each,他会把 [b, e) 区间的每个元素 x 调用一遍 f(x)。这里的 x 实际上是一个引用。如果 b 和 e 是常值迭代器则是个常引用，可以用 cbegin()，cend() 获取常值迭代器。
+
+```cpp
+thrust::device_vector<float> x(n);
+
+thrust::for_each(x.begin(), x.end(), [] __device__ (float &num){
+	num += 100.f;
+});
+
+thrust::host_vector<float> y = x;
+
+thrust::for_each(y.cbegin(), y.cend(), [] (float const &i) {
+	printf("%d\n", i);
+});
+```
+
+类似对应的函数模板还有 thrust::reduce，thrust::sort，thrust::find_if，thrust::count_if，thrust::reverse，thrust::inclusive_scan 等。
+
+### thrust 模板函数的特点
+
+thrust模板函数可以根据容器类型, 自动决定在GPU还是在CPU运行
+
+for_each 可以用于 device_vector 也可用于 host_vector。当用于 host_vector 时则函数是在 CPU 上执行的，用于 device_vector 时则是在 GPU 上执行的。
+
+这就是为什么我们用于 x 那个 for_each 的 lambda 有修饰，而用于 y 的那个 lambda 需要修饰 \__device__。
+
+### make_zip_iterator
+
+可以用 thrust::make_zip_iterator(a, b) 把多个迭代器合并起来, 相当于Python 里的 zip
+
+然后在函数体里通过 auto const &tup 捕获，并通过 thrust::get\<index>(tup) 获取这个合并迭代器的第 index 个元素……之所以他搞这么复杂，其实是因为 thrust 需要兼容一些“老年程序”爱用的 C++03，不然早该换成 C++11 的 std::tuple 和 C++17 的 structual-binding 语法了
+
+```cpp
+thrust::for_each(
+	turust::make_zip_iterator(x_dev.begin(), y_dev.cbegin()), 
+	thrust::make_zip_iterator(x_dev.end(), y_dev.cend()),
+	[a] __device__ (auto const &tup) {
+		auto &x = thrust::get<0>(tup);
+        auto const &y = thrust::get<1>(tup);
+        x = a * x + y;
+});
+```
+
+## 原子操作
+
+### 案例 : 数组求和
+
+如何并行地对数组进行求和操作 ?
+
+首先让我们试着用串行的思路来解题
+
+因为\__global__函数不能返回值, 只能通过指针. 因此我们先分配一个大小为1的sum数组, 其中的sum[0]用来返回数组的和. 这样同步之后就可以通过sum[0]看到结果了
+
+```cpp
+__global__ void parallel_sum (int *sum, int const *arr, int n) {
+    for(int i blockDim.x * blockIdx.x + threadIdx.x;i < n;i += blockDi.x * gridDim.x) {
+        sum[0] += arr[i];
+    }
+}
+
+int main() {
+    int n = 65536;
+    thrust::universal_vector<int> arr(n);
+    thrust::universal_vector<int> sum(1);
+    
+    auto int_rand = [] {
+        return std::rand() % 4;
+    };
+    
+    thrust::generate(arr.begin(), arr.end(), int_rand());
+    
+    TICK(parallel_sum);
+    parallel_sum<<<n/128, 128>>>(sum.data(), arr.data(), n);
+    checkCudaErrors(cudaDeviceSynchronize());
+    TOCK(parallel_sum);
+    
+    printf("result: %d\n", sum[0]);
+    
+    return 0;
+}
+```
+
+![image-20220302091852423](.\img\image-20220302091852423.png)
+
+却发现结果完全不对, 为什么捏
+
+这是因为GPU上的线程是并行执行的, 然而sum[0] += arr[i] 这个操作,实际上分为四步
+
+1. 读取sum[0]到寄存器A
+2. 读取arr[i]到寄存器B
+3. 让寄存器A的值加上寄存器B的值
+4. 将寄存器A上的值写回sum[0]
+
+```
+假如有两个线程分别在 i=0 和 i=1，同时执行：
+线程0：读取 sum[0] 到寄存器A（A=0）
+线程1：读取 sum[0] 到寄存器A（A=0）
+线程0：读取 arr[0] 到寄存器B（B=arr[0]）
+线程1：读取 arr[1] 到寄存器B（B=arr[1]）
+线程0：让寄存器A加上寄存器B（A=arr[0]）
+线程1：让寄存器A加上寄存器B（A=arr[1]）
+线程0：写回寄存器A到 sum[0]（sum[0]=arr[0]）
+线程1：写回寄存器A到 sum[0]（sum[0]=arr[1]）
+这样一来最后 sum[0] 的值是 arr[1]。而不是我们期望的 arr[0] + arr[1]，即算出来的总和变少了！
+```
+
+### atomicAdd
+
+这个时候我们就知道, 应该使用atomic了
+
+原子操作的功能就是保证读取/加法/写回三个操作，不会有另一个线程来打扰。
+
+CUDA 也提供了这种函数，即 atomicAdd。效果和 += 一样，不过是原子的。他的第一个参数是个指针，指向要修改的地址。第二个参数是要增加多少。也就是说：
+
+atomicAdd(dst, src) 和 *dst += src 差不多。
+
+```cpp
+__global__ void parallel_sum (int *sum, int const *arr, int n) {
+    for(int i blockDim.x * blockIdx.x + threadIdx.x;i < n;i += blockDi.x * gridDim.x) {
+        atomicAdd(&sum[0], arr[i]);
+    }
+}
+```
+
+atmoicAdd会返回旧值
+
+old = atomicAdd(dst, src) 其实相当于：old = *dst; *dst += src;
+
+利用这一点可以实现往一个全局的数组 res 里追加数据的效果（push_back），其中 sum 起到了记录当前数组大小的作用。
+
+因为返回的旧值就相当于在数组里“分配”到了一个位置一样，不会被别人占据。
+
+```cpp
+__global__ parallel_filter(int *sum, int *res, int *arr ,int n) {
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x;i < n;i += blockDim.x * gridDim.x) {
+        int loc = atomicAdd(&sum[0], 1);
+        res[loc] = arr[i];
+    }
+}
+
+int main() {
+    int n = 1 << 24;
+    std::vector<int, CudaAllocator<int>> arr(n);	//src
+    std::vector<int, CudaAllocator<int>> sum(1);	//指示器
+    std::vector<int, CudaAllocator<int>> res(n);	//dst
+    
+    for(int i = 0;i < n;i++) {
+        arr[i] = std::rand() % 4;
+    }
+    
+    TICK(parallel_filter);
+    parallel<<<n/ 4096, 512>>>(sum.data(), res.data(), arr.data(), n);
+    checkCudaErrors(cudaDeviceSynchronize());
+        
+    return 0;
+}
+```
+
+其他的原子操作
+
+```cpp
+atomicAdd(dst, src);
+    *dst += src;
+atomicSub(dst, src);
+    *dst -= src;
+atomicOr(dst, src);
+    *dst |= src;
+atomicAnd(dst, src);
+    *dst &= src;
+atomicXor(dst, src);
+	*dst ^= src;
+atomicMax(dst, src);
+    *dst = std::max(*dst, src);
+atomicMin(dst, src);
+    *dst = std::min(*dst, src);
+```
+
+当然，他们也都会返回旧值（如果需要的话）。
+
+除了之前带有运算的原子操作, 也有这种单纯是写入没有读出的
+
+```cpp
+old = atomicExch(dst, src);
+```
+
+相当于
+
+```cpp
+old = *dst;
+*dst = src;
+```
+
+*注：Exch是exchange的简写，对标的是std::atomic的exchange函数。*
+
+### atomicCAS
+
+atomicCAS可以原子地判断是否相等, 相等则写入,不相等则返回旧值
+
+```cpp
+old = atomicCAS(dst, cmp, src);
+```
+
+相当于
+
+```
+old = *dst;
+if(old == cmp)
+	*dst = src;
+```
+
+atomicCAS 的作用在于他可以用来实现任意 CUDA 没有提供的原子读-修改-写回指令。比如这里我们通过 atomicCAS 实现了整数 atomicAdd 同样的效果。
+
+```cpp
+__device__ __inline__ int my_atmoic_add(int *dst, int src) {
+	int old = *dst, expect;
+    do {
+        expect = old;
+        old = atomicCAS(&old, expect, expect + src);
+    }while(old != expect);
+    return old;
+}
+```
+
+如果换成expect * src,就变成了原子乘法atomicMul,虽然CUDA没提供,但是我们自己实现了
+
+在老版本的CUDA中的atomicAdd是不支持float的,可以使用CAS配合按位转换(bit-cast)函数\__float_as_int和__int_as_float实现浮点原子加法
+
+```cpp
+__device__ __inline__ int float_atomic_add(float *dst, float src) {
+	int old = __float_as_int(*dst), expect;
+	do {
+		expect = old;
+		old = atomicCAS((int *)dst, expect, __float_as_int(__int_as_float(expect) + src));
+	}while (edpect != old);
+	return old;
+}
+```
+
+### 原子操作的问题 : 影响性能
+
+不过由于原子操作要保证同一时刻只能有一个线程在修改某个地址，如果多个线程同时修改同一个就需要像“排队”那样，一个线程修改完了另一个线程才能进去，非常低效。
+
+解决方案 : 先累加到局部变量 local_sum，最后一次性累加到全局的 sum。
+
+这样每个线程就只有一次原子操作，而不是网格跨步循环的那么多次原子操作了。当然，我们需要调小 gridDim * blockDim 使其远小于 n，这样才能够减少原子操作的次数。比如下面就减少了 4096/512=8 倍的原子操作。
+
+```cpp
+__global__ void parallel_sum (int *sum, int const *arr, int n) {
+    int local_sum = 0;
+    for(int i blockDim.x * blockIdx.x + threadIdx.x;i < n;i += blockDi.x * gridDim.x) {
+        local_sum += arr[i];
+    }
+    atomicAdd(&sum[0], local_sum);
+}
+
+int main() {
+    int n = 65536;
+    thrust::universal_vector<int> arr(n);
+    thrust::universal_vector<int> sum(1);
+    
+    auto int_rand = [] {
+        return std::rand() % 4;
+    };
+    
+    thrust::generate(arr.begin(), arr.end(), int_rand());
+    
+    TICK(parallel_sum);
+    parallel_sum<<<n / 4096, 512>>>(sum.data(), arr.data(), n);
+    checkCudaErrors(cudaDeviceSynchronize());
+    TOCK(parallel_sum);
+    
+    printf("result: %d\n", sum[0]);
+    
+    return 0;
+}
+```
+
+## 板块与共享内存
 
