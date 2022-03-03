@@ -478,7 +478,13 @@ BENCHMARK(BM_reduce);
 BENCHMARK_MAIN();
 ```
 
-使用方法 : 在CMAKElist.txt里引入package
+使用方法 : 将benchmark文件夹放在代码目录下， 在CMakeist.txt里引入package
+
+```cmake
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Turn off the fking test!")
+add_subdirectory(benchmark)
+target_link_libraries(main PUBLIC benchmark)
+```
 
 ## 任务域和嵌套
 
@@ -545,7 +551,7 @@ int main() {
 	
 	tbb::parallel_for((size_t)0, (size_t)n, [&](size_t i){
 		std::lock_guard lck(mtx);
-		tbb::parallel_for((size_t)0, (size_t)n, [&](size_t i){
+		tbb::parallel_for((size_t)0, (size_t)n, [&](size_t j){
 			a[i * n + j] = std::sin(i) * std::sin(j);
 		});
 	});
