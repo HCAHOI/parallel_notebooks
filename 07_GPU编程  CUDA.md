@@ -1336,3 +1336,481 @@ SM又由多个流式单处理器(SP)组成. 每个SP可以处理一个或多个�
 因为每个线程都写入了不同的地址，所以不存在任何冲突，也不需要原子操作了。
 
 然后求出的大小为 n / 1024 的数组，已经足够小了，可以直接在 CPU 上完成最终的求和。也就是 GPU 先把数据尺寸缩减 1024 倍到 CPU 可以接受的范围内，然后让 CPU 完成的思路。
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+#include <vector>
+#include "CudaAllocator.h"
+#include "ticktock.h"
+
+__global__ void parallel_sum(int *sum, int const *arr, int n) {
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < n / 1024; i += blockDim.x * gridDim.x) {
+        int local_sum = 0;
+        for (int j = i * 1024; j < i * 1024 + 1024; j++) {
+            local_sum += arr[j];
+        }
+        sum[i] = local_sum;
+    }
+}
+
+int main() {
+    int n = 1<<24;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    std::vector<int, CudaAllocator<int>> sum(n / 1024);
+
+    for (int i = 0; i < n; i++) {
+        arr[i] = std::rand() % 4;
+    }
+
+    TICK(parallel_sum);
+    parallel_sum<<<n / 1024 / 128, 128>>>(sum.data(), arr.data(), n);	//n / 1024 / 128 个板块 每个板块有128个线程 共计 n / 1024 个线程
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    int final_sum = 0;
+    for (int i = 0; i < n / 1024; i++) {
+        final_sum += sum[i];
+    }
+    TOCK(parallel_sum);
+
+    printf("result: %d\n", final_sum);
+
+    return 0;
+}
+```
+
+刚刚我们直接用了一个 for 循环迭代所有1024个元素，实际上内部仍然是一个串行的过程，数据是强烈依赖的（local_sum += arr[j] 可以体现出，下一时刻的 local_sum 依赖于上一时刻的 local_sum）
+
+要消除这种依赖，可以通过这样的逐步缩减，这样每个 for 循环内部都是没有数据依赖，从而是可以并行的
+
+```cpp
+__global__ void parallel_sum(int *sum, int const *arr, int n) {
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < n / 1024; i += blockDim.x * gridDim.x) {
+        int local_sum[1024];
+        for (int j = 0; j < 1024; j++) {
+            local_sum[j] = arr[i * 1024 + j];
+        }
+        for (int j = 0; j < 512; j++) {
+            local_sum[j] += local_sum[j + 512];
+        }
+        for (int j = 0; j < 256; j++) {
+            local_sum[j] += local_sum[j + 256];
+        }
+        for (int j = 0; j < 128; j++) {
+            local_sum[j] += local_sum[j + 128];
+        }
+        for (int j = 0; j < 64; j++) {
+            local_sum[j] += local_sum[j + 64];
+        }
+        for (int j = 0; j < 32; j++) {
+            local_sum[j] += local_sum[j + 32];
+        }
+        for (int j = 0; j < 16; j++) {
+            local_sum[j] += local_sum[j + 16];
+        }
+        for (int j = 0; j < 8; j++) {
+            local_sum[j] += local_sum[j + 8];
+        }
+        for (int j = 0; j < 4; j++) {
+            local_sum[j] += local_sum[j + 4];
+        }
+        for (int j = 0; j < 2; j++) {
+            local_sum[j] += local_sum[j + 2];
+        }
+        for (int j = 0; j < 1; j++) {
+            local_sum[j] += local_sum[j + 1];
+        }
+        sum[i] = local_sum[0];
+    }
+}	//也就是说 比如 去掉数据依赖之后 第一个for循环 i = 0和i = 2和i = 100对应的语句就可以同时进行
+```
+
+![image-20220307003516282](.\img\image-20220307003516282.png)
+
+### 板块的共享内存 (shared memory)
+
+刚刚已经实现了无数据依赖可以并行的 for，那么如何把他真正变成并行的呢？这就是板块的作用了，我们可以把刚刚的线程升级为板块，刚刚的 for 升级为线程，然后把刚刚 local_sum 这个线程局部数组升级为板块局部数组。那么如何才能实现**板块局部数组**呢？
+
+同一个板块中的每个线程，都共享着一块存储空间，他就是共享内存。在 CUDA 的语法中，共享内存可以通过定义一个修饰了 __shared__ 的变量来创建。因此我们可以把刚刚的 local_sum 声明为 __shared__ 就可以让他从每个线程有一个，升级为每个板块有一个了。
+
+然后把刚刚的 j 换成板块编号，i 换成线程编号就好啦
+
+```cpp
+parallel_sum<<<n / 1024, 1024>>>(sum.data(), arr.data(),n); 
+```
+
+```cpp
+__global__ void parallel_sum(int *sum, int *arr, int n) {
+	__shared__ int localsum[1024];
+    int j = threadIdx.x;
+    int i = blockIdx.x;	//注意顺序 保证内存读取上的连续性
+    
+    local_sum[j] = arr[i * 1024 + j];
+    if(j < 512) {
+        local_sum[j] += local_sum[j + 512];
+    }
+    if(j < 256) {
+        local_sum[j] += local_sum[j + 256];
+    }
+    if(j < 128) {
+        local_sum[j] += local_sum[j + 128];
+    }
+    if(j < 64) {
+        local_sum[j] += local_sum[j + 64];
+    }
+    if(j < 32) {
+        local_sum[j] += local_sum[j + 32];
+    }
+    if(j < 16) {
+        local_sum[j] += local_sum[j + 16];
+    }
+    if(j < 8) {
+        local_sum[j] += local_sum[j + 8];
+    }
+    if(j < 4) {
+        local_sum[j] += local_sum[j + 4];
+    }
+    if(j < 2) {
+        local_sum[j] += local_sum[j + 2];
+    }
+    if(j == 0) {
+        sum[i] = local_sum[0] + local_sum[1];
+    }
+}
+```
+
+但是算出来的结果好像不太对?
+
+这是因为 SM 执行一个板块中的线程时，并不是全部同时执行的。而是一会儿执行这个线程，一会儿执行那个线程。有可能一个线程已经执行到 if (j < 32) 了，而另一个线程还没执行完 if (j < 64)，从而出错。可是为什么 GPU 要这样设计？
+
+因为其中某个线程有可能因为在等待内存数据的抵达，这时大可以切换到另一个线程继续执行计算任务，等这个线程陷入内存等待时，原来那个线程说不定就好了呢？（记得上节课说过内存延迟是阻碍 CPU 性能提升的一大瓶颈，GPU 也是如此。CPU 解决方案是超线程技术，一个物理核提供两个逻辑核，当一个逻辑核陷入内存等待时切换到另一个逻辑核上执行，避免空转。GPU 的解决方法就是单个 SM 执行很多个线程，然后在遇到内存等待时，就自动切换到另一个线程）
+
+因此，我们可以给每个 if 分支后面加上 __syncthreads() 指令。
+
+他的功能是，强制同步当前板块内的所有线程。也就是让所有线程都运行到 __syncthreads() 所在位置以后，才能继续执行下去。
+
+这样就能保证之前其他线程的 local_sum 都已经写入成功了。
+
+```cpp
+__global__ void parallel_sum(int *sum, int *arr, int n) {
+	__shared__ int localsum[1024];
+    int j = threadIdx.x;
+    int i = blockIdx.x;	//注意顺序 保证内存读取上的连续性
+    
+    local_sum[j] = arr[i * 1024 + j];
+    __syncthreads();
+    if(j < 512) {
+        local_sum[j] += local_sum[j + 512];
+    }
+    __syncthreads();
+    if(j < 256) {
+        local_sum[j] += local_sum[j + 256];
+    }
+    __syncthreads();
+    if(j < 128) {
+        local_sum[j] += local_sum[j + 128];
+    }
+    __syncthreads();
+    if(j < 64) {
+        local_sum[j] += local_sum[j + 64];
+    }
+    __syncthreads();
+    if(j < 32) {
+        local_sum[j] += local_sum[j + 32];
+    }
+    __syncthreads();
+    if(j < 16) {
+        local_sum[j] += local_sum[j + 16];
+    }
+    __syncthreads();
+    if(j < 8) {
+        local_sum[j] += local_sum[j + 8];
+    }
+    __syncthreads();
+    if(j < 4) {
+        local_sum[j] += local_sum[j + 4];
+    }
+    __syncthreads();
+    if(j < 2) {
+        local_sum[j] += local_sum[j + 2];
+    }
+    __syncthreads();
+    if(j == 0) {
+        sum[i] = local_sum[0] + local_sum[1];
+    }
+}
+```
+
+### 线程组(warp) : 32个线程为一组
+
+其实，SM 对线程的调度是按照 32 个线程为一组来调度的。也就是说，0-31号线程为一组，32-63号线程为一组，以此类推。
+
+因此 SM 的调度无论如何都是对一整个线程组（warp）进行的，不可能出现一个组里只有单独一个线程被调走，要么 32 个线程一起调走。
+
+所以其实 j < 32 之后，就不需要 __syncthreads() 了。因为此时所有访问 local_sum 的线程都在一个组里嘛！反正都是一起调度走，不需要同步。
+
+结果却出错了，难道warp 调度不对？
+
+其实是编译器自作聪明优化了我们对 local_sum 的访问，导致结果不对的。解决：把 local_sum 数组声明为 volatile 禁止编译器优化
+
+```cpp
+__shared__ volatile int local_sum[1024];
+```
+
+### 线程组分歧(warp divergence)
+
+GPU 线程组（warp）中 32 个线程实际是绑在一起执行的，就像 CPU 的 SIMD 那样。因此如果出现分支（if）语句时，如果 32 个 cond 中有的为真有的为假，则会导致两个分支都被执行！不过在 cond 为假的那几个线程在真分支会避免修改寄存器和访存，产生副作用。而为了避免会产生额外的开销。因此建议 GPU 上的 if 尽可能 32 个线程都处于同一个分支，要么全部真要么全部假，否则实际消耗了两倍时间！
+
+![image-20220307005143285](.\img\image-20220307005143285.png)
+
+那么在之前程序中的条件判断就会影响程序的效率
+
+解决方案: 我们加 if 的初衷是为了节省不必要的运算用的，然而对于 j < 32 以下那几个并没有节省运算（因为分支是按 32 个线程一组的），反而增加了分歧需要避免副作用的开销。因此可以把 j < 32 以下的那几个赋值合并为一个，这样反而快。
+
+```cpp
+__global__ void parallel_sum(int *sum, int *arr, int n) {
+	__shared__ volatile int local_sum[1024];
+    int j = threadIdx.x;
+    int i = blockIdx.x;	//注意顺序 保证内存读取上的连续性
+    
+    local_sum[j] = arr[i * 1024 + j];
+    __syncthreads();
+    if(j < 512) {
+        local_sum[j] += local_sum[j + 512];
+    }
+    __syncthreads();
+    if(j < 256) {
+        local_sum[j] += local_sum[j + 256];
+    }
+    __syncthreads();
+    if(j < 128) {
+        local_sum[j] += local_sum[j + 128];
+    }
+    __syncthreads();
+    if(j < 64) {
+        local_sum[j] += local_sum[j + 64];
+    }
+    __syncthreads();
+    if (j < 32) {
+        local_sum[j] += local_sum[j + 32];
+        local_sum[j] += local_sum[j + 16];
+        local_sum[j] += local_sum[j + 8];
+        local_sum[j] += local_sum[j + 4];
+        local_sum[j] += local_sum[j + 2];
+        if (j == 0) {
+            sum[i] = local_sum[0] + local_sum[1];
+        }
+    }
+}
+```
+
+### 网格跨步循环版本
+
+共享内存中做求和开销还是有点大，之后那么多次共享内存的访问，前面却只有一次全局内存 arr 的访问，是不是太少了。
+
+因此可以通过网格跨步循环增加每个线程访问 arr 的次数，从而超过共享内存部分的时间。
+
+当然也别忘了在 main 中改变 gridDim 的大小
+
+```cpp
+parallel<<<n / 4096, 1024>>>(sum.data(), arr.data(), n);
+checkCudaErrors(cudaDeviceSynchronize());
+int final_sum = 0;
+for(int i = 0;i < n / 4096; i++) {
+	final_sum += sum[i];
+}
+```
+
+```cpp
+__global__ void parallel_sum(int *sum, int *arr ,int n) {
+	__shared__ volatile int local_sum[1024];
+	int j = threadIdx.x;
+	int i = blockIdx.x;
+	int temp_sum = 0;
+	for(int t = i * 1024 + j; t < n; t += 1024 * gridDim.x) {
+        temp_sum += arr[t];
+    }
+    local_sum[j] = temp_sum;
+    __syncthreads();
+    if (j < 512) {
+        local_sum[j] += local_sum[j + 512];
+    }
+    __syncthreads();
+    if (j < 256) {
+        local_sum[j] += local_sum[j + 256];
+    }
+    __syncthreads();
+    if (j < 128) {
+        local_sum[j] += local_sum[j + 128];
+    }
+    __syncthreads();
+    if (j < 64) {
+        local_sum[j] += local_sum[j + 64];
+    }
+    __syncthreads();
+    if (j < 32) {
+        local_sum[j] += local_sum[j + 32];
+        local_sum[j] += local_sum[j + 16];
+        local_sum[j] += local_sum[j + 8];
+        local_sum[j] += local_sum[j + 4];
+        local_sum[j] += local_sum[j + 2];
+        if (j == 0) {
+            sum[i] = local_sum[0] + local_sum[1];
+        }
+    }
+}
+```
+
+### 模板化
+
+我们可以通过模板函数进行包装
+
+```cpp
+template <int blockSize, class T>
+__global__ void parallel_sum_kernel(T *sum, T const *arr, int n) {
+    __shared__ volatile int local_sum[blockSize];
+    int j = threadIdx.x;
+    int i = blockIdx.x;
+    T temp_sum = 0;
+    for (int t = i * blockSize + j; t < n; t += blockSize * gridDim.x) {
+        temp_sum += arr[t];
+    }
+    local_sum[j] = temp_sum;
+    __syncthreads();
+    if constexpr (blockSize >= 1024) {
+        if (j < 512)
+            local_sum[j] += local_sum[j + 512];
+        __syncthreads();
+    }
+    if constexpr (blockSize >= 512) {
+        if (j < 256)
+            local_sum[j] += local_sum[j + 256];
+        __syncthreads();
+    }
+    if constexpr (blockSize >= 256) {
+        if (j < 128)
+            local_sum[j] += local_sum[j + 128];
+        __syncthreads();
+    }
+    if constexpr (blockSize >= 128) {
+        if (j < 64)
+            local_sum[j] += local_sum[j + 64];
+        __syncthreads();
+    }
+    if (j < 32) {
+        if constexpr (blockSize >= 64)
+            local_sum[j] += local_sum[j + 32];
+        if constexpr (blockSize >= 32)
+            local_sum[j] += local_sum[j + 16];
+        if constexpr (blockSize >= 16)
+            local_sum[j] += local_sum[j + 8];
+        if constexpr (blockSize >= 8)
+            local_sum[j] += local_sum[j + 4];
+        if constexpr (blockSize >= 4)
+            local_sum[j] += local_sum[j + 2];
+        if (j == 0) {
+            sum[i] = local_sum[0] + local_sum[1];
+        }
+    }
+}
+```
+
+```cpp
+template <int reduceScale = 4096, int blockSize = 256, class T>
+int parallel_sum(T const *arr, int n) {
+    std::vector<int, CudaAllocator<int>> sum(n / reduceScale);
+    parallel_sum_kernel<blockSize><<<n / reduceScale, blockSize>>>(sum.data(), arr, n);
+    checkCudaErrors(cudaDeviceSynchronize());
+    T final_sum = 0;
+    for (int i = 0; i < n / reduceScale; i++) {
+        final_sum += sum[i];
+    }
+    return final_sum;
+}
+
+int main() {
+    int n = 1<<24;
+    std::vector<int, CudaAllocator<int>> arr(n);
+    std::vector<int, CudaAllocator<int>> sum(n / 4096);
+
+    for (int i = 0; i < n; i++) {
+        arr[i] = std::rand() % 4;
+    }
+
+    TICK(parallel_sum);
+    int final_sum = parallel_sum(arr.data(), n);
+    TOCK(parallel_sum);
+
+    printf("result: %d\n", final_sum);
+
+    return 0;
+}
+```
+
+使用板块局部数组（共享内存）来加速数组求和
+
+这就是 BLS（block-local storage）
+
+### 递归求和
+
+递归地缩并，时间复杂度是 O(logn)。
+
+同样是缩并到一定小的程度开始就切断(cutoff)，开始用 CPU 串行求和。
+
+```cpp
+template <int reduceScale = 4096, int blockSize = 256, int cutoffSize = reduceScale * 2, class T>
+int parallel_sum(T const *arr, int n) {
+    if (n > cutoffSize) {
+        std::vector<int, CudaAllocator<int>> sum(n / reduceScale);
+        parallel_sum_kernel<blockSize><<<n / reduceScale, blockSize>>>(sum.data(), arr, n);
+        return parallel_sum(sum.data(), n / reduceScale);
+    } else {
+        checkCudaErrors(cudaDeviceSynchronize());
+        T final_sum = 0;
+        for (int i = 0; i < n; i++) {
+            final_sum += arr[i];
+        }
+        return final_sum;
+    }
+}
+```
+
+### 编译器真聪明口牙!
+
+刚刚说到虽然用了 atomicAdd 按理说是非常低效的，然而实际却没有低效，这是因为编译器自动优化成刚刚用 BLS 的数组求和了！可以看到他优化后的效率和我们的 BLS 相仿，甚至还要快一些！
+
+结论：刚刚我们深入研究了如何 BLS 做数组求和，只是出于学习原理的目的。实际做求和时，直接写 atomicAdd 即可。反正编译器会自动帮我们优化成 BLS，而且他优化得比我们手写的更好
+
+```cpp
+__global__ void parallel_sum (int *sum, int const *arr, int n) {
+    int local_sum = 0;
+    for(int i blockDim.x * blockIdx.x + threadIdx.x;i < n;i += blockDi.x * gridDim.x) {
+        local_sum += arr[i];
+    }
+    atomicAdd(&sum[0], local_sum);
+}
+
+int main() {
+    int n = 65536;
+    thrust::universal_vector<int> arr(n);
+    thrust::universal_vector<int> sum(1);
+    
+    auto int_rand = [] {
+        return std::rand() % 4;
+    };
+    
+    thrust::generate(arr.begin(), arr.end(), int_rand());
+    
+    parallel_sum<<<n / 4096, 512>>>(sum.data(), arr.data(), n);
+    checkCudaErrors(cudaDeviceSynchronize());
+    
+    printf("result: %d\n", sum[0]);
+    
+    return 0;
+}
+```
+
+## 共享内存进阶
