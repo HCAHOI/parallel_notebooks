@@ -1839,7 +1839,7 @@ int main() {
 
 ![image-20220307113913055](.\img\image-20220307113913055.png)
 
-#### 板块中线程数过多 : 寄存器溢出(register spill)
+### 板块中线程数过多 : 寄存器溢出(register spill)
 
 GPU 线程的寄存器，实际上也是一块比较小而块的内存，称之为寄存器仓库（register file）。板块内的所有的线程共用一个寄存器仓库。
 
@@ -1848,3 +1848,195 @@ GPU 线程的寄存器，实际上也是一块比较小而块的内存，称之�
 此外，如果在线程局部分配一个数组，并通过动态下标访问（例如遍历 BVH 时用到的模拟栈），那无论如何都是会溢出到一级缓存的，因为寄存器不能动态寻址。
 
 对于 Fermi 架构来说，每个线程最多可以有 63 个寄存器（每个有 4 字节）。
+
+### 板块中线程数过少 : 延迟隐藏(latency hiding)失败
+
+我们说过,每个SM一次只能执行板块中的一个线程组(warp), 也就是32个线程
+
+当线程组陷入等待时, 可以切换到另一个进程, 继续计算, 这样一个warp的内存延迟就被另一个warp的计算延迟隐藏起来了, 如果线程数量过少, 就无法通过在多个warp之间调度来隐藏内存等待的延迟, 从而低效
+
+此外, 最好能让板块中的线程数量(blockDim)为32的整数倍, •否则假如是 33 个线程的话，那还是需要启动两个 warp，其中第二个 warp 只有一个线程是有效的，非常浪费。
+
+结论：对于使用寄存器较少、访存为主的核函数（例如矢量加法），使用大 blockDim 为宜。反之（例如光线追踪）使用小 blockDim，但也不宜太小。
+
+### 案例 : 矩阵转置
+
+对于以下的矩阵转置函数
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+#include <vector>
+#include "CudaAllocator.h"
+#include "ticktock.h"
+
+template <class T>
+__global__ void parallel_transpose(T *out, T const *in, int nx, int ny) {
+    int linearized = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = linearized / nx;	//步进较慢的y
+    int x = linearized % nx;	//步进较快的x
+    if (x >= nx || y >= ny) return;
+    out[y * nx + x] = in[x * nx + y];	//对于out,x步进快,相当于行主序,就很好;对于in来说,y步进慢,所以访问是不连续的,就会比较慢   (y * nx + x) = (y, x) (x * nx + y) = (x, y)
+}
+
+int main() {
+    int nx = 1<<14, ny = 1<<14;	//nx : 每行元素数 ny : 每列元素数 
+    std::vector<int, CudaAllocator<int>> in(nx * ny);
+    std::vector<int, CudaAllocator<int>> out(nx * ny);
+
+    for (int i = 0; i < nx * ny; i++) {
+        in[i] = i;
+    }
+
+    TICK(parallel_transpose);
+    parallel_transpose<<<nx * ny / 1024, 1024>>>
+        (out.data(), in.data(), nx, ny);
+    checkCudaErrors(cudaDeviceSynchronize());
+    TOCK(parallel_transpose);
+
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < nx; x++) {
+            if (out[y * nx + x] != in[x * nx + y]) {
+                printf("Wrong At x=%d,y=%d: %d != %d\n", x, y,
+                       out[y * nx + x], in[x * nx + y]);
+                return -1;
+            }
+        }
+    }
+
+    printf("All Correct!\n");
+    return 0;
+}
+```
+
+CPU 上的并行 for，通常会做循环分块提升缓存局域性。但是如果我们是传统的两层的 for 循环就低效了，对于矩阵转置这种需要 y 方向非连续访问而言，循环分块会带来很大提升。
+
+所以该怎么做才能让 GPU 也循环分块呢？
+
+这就是板块的多维存在的意义
+
+只需要使用二维的 blockDim 和 gridDim，然后在核函数里分别计算 x 和 y 的扁平化线程编号就行了！他会自动变成 循环分块一样的效果，有利于缓存局域性。
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "helper_cuda.h"
+#include <vector>
+#include "CudaAllocator.h"
+#include "ticktock.h"
+
+template <class T>
+__global__ void parallel_transpose(T *out, T const *in, int nx, int ny) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;	//自动循环分块
+    if (x >= nx || y >= ny) return;
+    out[y * nx + x] = in[x * nx + y];
+}
+
+int main() {
+    int nx = 1<<14, ny = 1<<14;	//
+    std::vector<int, CudaAllocator<int>> in(nx * ny);
+    std::vector<int, CudaAllocator<int>> out(nx * ny);
+
+    for (int i = 0; i < nx * ny; i++) {
+        in[i] = i;
+    }
+
+    TICK(parallel_transpose);
+    parallel_transpose<<<dim3(nx / 32, ny / 32, 1), dim3(32, 32, 1)>>> //32 * 32 = 1024
+        (out.data(), in.data(), nx, ny);
+    checkCudaErrors(cudaDeviceSynchronize());
+    TOCK(parallel_transpose);
+
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < nx; x++) {
+            if (out[y * nx + x] != in[x * nx + y]) {
+                printf("Wrong At x=%d,y=%d: %d != %d\n", x, y,
+                       out[y * nx + x], in[x * nx + y]);
+                return -1;
+            }
+        }
+    }
+
+    printf("All Correct!\n");
+    return 0;
+}
+```
+
+### 再优化 : 使用共享内存
+
+刚刚那样的话对 in 的读取是存在跨步的，而 GPU 喜欢连续的顺序读取，这样跨步就不高效了。
+
+但是因为我们的目的是做矩阵转置，无论是 in 还是 out 必然有一个是需要跨步的，怎么办？
+
+因此可以先通过把 in 分块，按块跨步地读，而块内部则仍是连续地读——从低效全局的内存读到高效的共享内存中，然后在共享内存中跨步地读，连续地写到 out 指向的低效的全局内存中。
+
+这样跨步的开销就开在高效的共享内存上，而不是低效的全局内存上，因此会变快。
+
+```cpp
+template <int blockSize, class T>
+__global__ void parallel_transpose(T *out, T const *in, int nx, int ny) {
+    int x = blockIdx.x * blockSize + threadIdx.x;
+    int y = blockIdx.y * blockSize + threadIdx.y;
+    if (x >= nx || y >= ny) return;
+    __shared__ T tmp[blockSize * blockSize];
+    int rx = blockIdx.y * blockSize + threadIdx.x;
+    int ry = blockIdx.x * blockSize + threadIdx.y;
+    tmp[threadIdx.y * blockSize + threadIdx.x] = in[ry * nx + rx];
+    __syncthreads();
+    out[y * nx + x] = tmp[threadIdx.x * blockSize + threadIdx.y];
+}
+```
+
+### 区块(bank)
+
+#### Intro
+
+GPU 的共享内存，实际上是 32 块内存条通过并联组成的（有点类似 CPU 的双通道内存条）。
+
+每个 bank 都可以独立地访问，他们每个时钟周期都可以读取一个 int。
+
+然后，他们把地址空间分为 32 分，第 i 根内存条，负责 addr % 32 == i 的那几个 int 的存储。这样交错存储，可以保证随机访问时，访存能够尽量分摊到 32 个区块，这样速度就提升了 32 倍。
+
+比如：__shared__ int arr[1024];
+
+那么 arr[0] 是存储在 bank 0，arr[1] 是 bank 1……arr[32] 又是 bank 0，arr[33] 又是 bank 1。
+
+
+
+![image-20220308133140469](.\img\image-20220308133140469.png)
+
+#### 区块冲突(bank conflict)
+
+然而这种设计有一个问题，那就是如果多个线程同时访问到了同一个 bank 的话，就需要排队。比如下图，线程0-3同时访问了 bank 0，但是同一个 bank 是需要排队，也就是串行访问的，所以线程0-3实际上没有真正并行起来，慢了4倍！
+
+那可能你觉得好像没什么问题，反正一般不会让两个线程访问 __shared__ 数组的同一个元素嘛！但是别忘了，刚刚说了 bank 是按照 addr % 32 来划分的，也就是说 arr[0] 和 arr[32] 是同属于 bank 0 的，如果两个线程同时访问了 arr[0] 和 arr[32] 就会出现 bank conflict 导致必须排队影响性能！
+
+![image-20220308133305701](.\img\image-20220308133305701.png)
+
+#### 解决方案
+
+而刚刚那个矩阵转置的例子，这里的 blockSize 是 32。可以看到第一个对 tmp 的访问是没冲突的。
+
+而分析一下第二个对 tmp 的访问：threadIdx=(0,0) 的线程 0 会访问 tmp[0] 位于 bank 0；threadIdx=(0,1) 的线程 1 会访问 tmp[32] 也位于 bank 0；threadIdx=(0,1) 的线程 2 会访问 tmp[64] 也位于 bank 0……也就是说，同一个 warp 的所有线程都在访问 bank 0！这导致读取无法并行，必须串行排队，从而（单看共享内存的效率）会变慢 32 倍。
+
+![image-20220308133440368](.\img\image-20220308133440368.png)
+
+解决方法就是，把 tmp 这个二维数组从 32x32 变成 **33x32**。通常我们总以为把数组大小对齐到二的幂次是好事，但对共享内存对齐地划分 bank 这种独特的特性来说，有时故意不对齐反而是好事……
+
+这样线程 0 访问的就是 arr[0] 位于 bank 0，线程 1 访问的就是 arr[33] 位于 bank 1，线程 2 访问的就是 arr[66] 位于 bank 2……正好变成了一个线程访问一个 bank，没有冲突，不需要排队，从而可以并行访问！
+
+### GPU优化手法总结
+
+* 线程组分歧（wrap divergence）：尽量保证 32 个线程都进同样的分支，否则两个分支都会执行。
+
+* 延迟隐藏（latency hiding）：需要有足够的 blockDim 供 SM 在陷入内存等待时调度到其他线程组。
+
+* 寄存器溢出（register spill）：如果核函数用到很多局部变量（寄存器），则 blockDim 不宜太大。
+
+* 共享内存（shared memory）：全局内存比较低效，如果需要多次使用，可以先读到共享内存。
+
+* 跨步访问（coalesced acccess）：建议先顺序读到共享内存，让高带宽的共享内存来承受跨步。
+
+* 区块冲突（bank conflict）：同一个 warp 中多个线程访问共享内存中模 32 相等的地址会比较低效，可以把数组故意搞成不对齐的 33 跨步来避免。
